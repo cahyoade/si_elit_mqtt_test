@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/rand"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -32,7 +33,7 @@ func getRandomHexString(length int) string {
 
 func getStats(responseTimes map[string]requestTimer) (time.Duration, time.Duration, time.Duration, int32) {
 	total := time.Duration(0)
-	min := time.Duration(99999)
+	min := time.Duration(99999 * time.Hour)
 	max := time.Duration(0)
 	errorCount := int32(0)
 
@@ -109,7 +110,7 @@ func testRate(broker string, port int16, topic string, qos byte, requestCount in
 	}()
 }
 
-func singleClientTest(broker string, port int16, topic string, qos byte, numOfRequests int, delayms int, rateStep int, resultsMap map[string]requestTimer, wg *sync.WaitGroup, mutex *sync.RWMutex) {
+func singleClientTest(broker string, port int16, topic string, qos byte, numOfRequests int, delayms int, rateStep int, resultsMap map[string]requestTimer, wg *sync.WaitGroup, mutex *sync.RWMutex, file *os.File) {
 	for {
 		localWg := sync.WaitGroup{}
 		localMutex := sync.RWMutex{}
@@ -146,8 +147,19 @@ func singleClientTest(broker string, port int16, topic string, qos byte, numOfRe
 		if mutex != nil {
 			mutex.Lock()
 		}
+
+		if delayms > 1 {
+			file.WriteString(fmt.Sprintf("\nDevice: %v, Testing on %vreq/s with %v requests\n", topic, 1000/delayms, numOfRequests))
+		} else {
+			file.WriteString(fmt.Sprintf("\nDevice: %v, Testing max req/s with %v requests\n", topic, numOfRequests))
+		}
+		file.WriteString(fmt.Sprintf("\nMin: %s, Max: %s, Avg: %s\n", min, max, avg))
+		file.WriteString(fmt.Sprintf("Time: %s\n", duration))
+		file.WriteString(fmt.Sprintf("Error count: %d\n", errorCount))
+
 		for k, v := range responseTimes {
 			resultsMap[k] = v
+			file.WriteString(fmt.Sprintf("Id:%s, StartTime: %s, EndTime%s, Duration: %s\n", k, v.startTime, v.endTime, v.duration))
 		}
 		if mutex != nil {
 			mutex.Unlock()
@@ -155,6 +167,7 @@ func singleClientTest(broker string, port int16, topic string, qos byte, numOfRe
 		if delayms <= 1 {
 			break
 		}
+
 		delayms /= rateStep
 	}
 
@@ -164,19 +177,26 @@ func singleClientTest(broker string, port int16, topic string, qos byte, numOfRe
 }
 
 func main() {
+	var input string
+	f, err := os.Create("result.txt")
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	defer f.Close()
 
-	broker := "localhost"
+	broker := "192.168.10.178"
 	port := 1883
 	qos := byte(0)
 
 	rateStep := 2
-	numOfRequests := 10000
+	numOfRequests := 1000
 	initialDelayms := 500
 	responseTimesTotal := make(map[string]requestTimer)
 
 	fmt.Println("Testing single client request rate")
 	singleClientTestStartTime := time.Now()
-	singleClientTest(broker, int16(port), "Device1", qos, numOfRequests, initialDelayms, rateStep, responseTimesTotal, nil, nil)
+	singleClientTest(broker, int16(port), "Device1", qos, numOfRequests, initialDelayms, rateStep, responseTimesTotal, nil, nil, f)
 	singleClientTestDuration := time.Since(singleClientTestStartTime)
 
 	min, max, avg, errorCount := getStats(responseTimesTotal)
@@ -188,25 +208,79 @@ func main() {
 	fmt.Printf("Max Rate: ~%vreq/s\n", int(time.Second/avg))
 	fmt.Printf("Max troughput: ~%vbytes/s\n", int(time.Second/avg)*53)
 
+	f.WriteString("\nSingle client request rate test done.\n")
+	f.WriteString(fmt.Sprintf("Total time: %s\n", singleClientTestDuration))
+	f.WriteString(fmt.Sprintf("Total requests: %d\n", len(responseTimesTotal)))
+	f.WriteString(fmt.Sprintf("Total error count: %d\n", errorCount))
+	f.WriteString(fmt.Sprintf("Min: %s, Max: %s, Avg: %s\n", min, max, avg))
+	f.WriteString(fmt.Sprintf("Max Rate: ~%vreq/s\n", int(time.Second/avg)))
+	f.WriteString(fmt.Sprintf("Max troughput: ~%vbytes/s\n", int(time.Second/avg)*53))
+
 	fmt.Println("\nTesting multiple clients request rate")
+	f.WriteString("\nTesting multiple clients request rate")
 	responseTimesTotal = make(map[string]requestTimer)
 	wgMultiClientTest := sync.WaitGroup{}
 	mutexMultiClientTest := sync.RWMutex{}
 	multiClientTestStartTime := time.Now()
 	numOfRequests = 100
-	numOfClients := 100
-	for i := 1; i < numOfClients+1; i++ {
-		wgMultiClientTest.Add(1)
-		go singleClientTest(broker, int16(port), fmt.Sprintf("Device%d", i), qos, numOfRequests, initialDelayms, rateStep, responseTimesTotal, &wgMultiClientTest, &mutexMultiClientTest)
+	numOfClients := 2
+	newNumClientFactor := 2
+
+	for {
+		subMultiClientTestStartTime := time.Now()
+		fmt.Printf("\nTesting with %v clients\n", numOfClients)
+		f.WriteString(fmt.Sprintf("\nTesting with %v clients\n", numOfClients))
+
+		for i := 1; i < numOfClients+1; i++ {
+			wgMultiClientTest.Add(1)
+			go singleClientTest(broker, int16(port), fmt.Sprintf("Device%d", i), qos, numOfRequests, 0, rateStep, responseTimesTotal, &wgMultiClientTest, &mutexMultiClientTest, f)
+		}
+		wgMultiClientTest.Wait()
+
+		fmt.Printf("\nMulti client request rate with %v clients done.\n", numOfClients)
+		fmt.Printf("Total time: %s\n", time.Since(subMultiClientTestStartTime))
+		fmt.Printf("Total requests: %d\n", len(responseTimesTotal))
+		fmt.Printf("Total error count: %d\n", errorCount)
+		fmt.Printf("Min: %s, Max: %s, Avg: %s\n", min, max, avg)
+		fmt.Printf("Max Rate: ~%vreq/s\n", int(time.Second/avg))
+		fmt.Printf("Max troughput: ~%vbytes/s\n", int(time.Second/avg)*53)
+
+		f.WriteString(fmt.Sprintf("\nMulti client request rate with %v clients done.\n", numOfClients))
+		f.WriteString(fmt.Sprintf("Total time: %s\n", time.Since(subMultiClientTestStartTime)))
+		f.WriteString(fmt.Sprintf("Total requests: %d\n", len(responseTimesTotal)))
+		f.WriteString(fmt.Sprintf("Total error count: %d\n", errorCount))
+		f.WriteString(fmt.Sprintf("Min: %s, Max: %s, Avg: %s\n", min, max, avg))
+		f.WriteString(fmt.Sprintf("Max Rate: ~%vreq/s\n", int(time.Second/avg)))
+		f.WriteString(fmt.Sprintf("Max troughput: ~%vbytes/s\n", int(time.Second/avg)*53))
+
+		numOfClients *= newNumClientFactor
+		if numOfClients > 128 {
+			break
+		}
 	}
-	wgMultiClientTest.Wait()
+
 	multiClientTestDuration := time.Since(multiClientTestStartTime)
 	min, max, avg, errorCount = getStats(responseTimesTotal)
-	fmt.Println("\nMulti client request rate test done.")
+	fmt.Printf("\nMulti client request rate test done.\n")
 	fmt.Printf("Total time: %s\n", multiClientTestDuration)
 	fmt.Printf("Total requests: %d\n", len(responseTimesTotal))
 	fmt.Printf("Total error count: %d\n", errorCount)
 	fmt.Printf("Min: %s, Max: %s, Avg: %s\n", min, max, avg)
-	fmt.Printf("Max Rate: ~%vreq/s\n", int(time.Second/avg)*numOfClients)
-	fmt.Printf("Max troughput: ~%vbytes/s\n", int(time.Second/avg)*53*numOfClients)
+	fmt.Printf("Max Rate: ~%vreq/s\n", int(time.Second/avg))
+	fmt.Printf("Max troughput: ~%vbytes/s\n", int(time.Second/avg)*53)
+
+	f.WriteString("\nMulti client request rate test done.\n")
+	f.WriteString(fmt.Sprintf("Total time: %s\n", multiClientTestDuration))
+	f.WriteString(fmt.Sprintf("Total requests: %d\n", len(responseTimesTotal)))
+	f.WriteString(fmt.Sprintf("Total error count: %d\n", errorCount))
+	f.WriteString(fmt.Sprintf("Min: %s, Max: %s, Avg: %s\n", min, max, avg))
+	f.WriteString(fmt.Sprintf("Max Rate: ~%vreq/s\n", int(time.Second/avg)*numOfClients))
+	f.WriteString(fmt.Sprintf("Max troughput: ~%vbytes/s\n", int(time.Second/avg)*53*numOfClients))
+
+	time.Sleep(10 * time.Second)
+
+	for input != "exit" {
+		fmt.Println("\nTesting done. type 'exit' to exit")
+		fmt.Scanln(&input)
+	}
 }
